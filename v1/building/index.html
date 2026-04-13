@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>Building and Running DocumentDB from Source - DocumentDB</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Building and Running DocumentDB from Source";
+        var mkdocs_page_input_path = "v1/building.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> DocumentDB
+        </a><div role="search">
+  <form id ="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+      <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" title="Type search term here" />
+  </form>
+</div>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption"><span class="caption-text">Version 1.0</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../">Get Started</a>
+                  </li>
+                  <li class="toctree-l1"><a class="" href="../documentdb.md">Introduction</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../prebuild/">Prebuild Images</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../gateway/">Gateway</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">DocumentDB</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+      <li class="breadcrumb-item active">Building and Running DocumentDB from Source</li>
+    <li class="wy-breadcrumbs-aside">
+          <a href="https://github.com/microsoft/documentdb/edit/master/docs/v1/building.md" class="icon icon-github"> Edit on GitHub</a>
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="building-and-running-documentdb-from-source">Building and Running DocumentDB from Source<a class="headerlink" href="#building-and-running-documentdb-from-source" title="Permanent link">&para;</a></h1>
+<p>If you want to build and run DocumentDB from source (instead of using Docker), follow these steps. This guide is designed for beginners and works best on Ubuntu/Debian. For other operating systems, package names may differ.</p>
+<h3 id="prerequisites">Prerequisites<a class="headerlink" href="#prerequisites" title="Permanent link">&para;</a></h3>
+<p><em>Recommended</em> use the provided devcontainer for VSCode which contains all the dependencies pre-installed.</p>
+<p>Or install the required dependencies:</p>
+<pre><code class="language-bash">sudo apt update
+sudo apt install build-essential libbson-dev postgresql-server-dev-all pkg-config rustc cargo
+</code></pre>
+<h3 id="step-1-build-postgresql-extensions">Step 1: Build PostgreSQL Extensions<a class="headerlink" href="#step-1-build-postgresql-extensions" title="Permanent link">&para;</a></h3>
+<pre><code class="language-bash">sudo make install
+</code></pre>
+<h3 id="step-2-build-the-gateway">Step 2: Build the Gateway<a class="headerlink" href="#step-2-build-the-gateway" title="Permanent link">&para;</a></h3>
+<pre><code class="language-bash">scripts/build_and_install_with_pgrx.sh -i -d pg_documentdb_gw_host/
+</code></pre>
+<h3 id="step-3-start-postgresql-and-the-gateway">Step 3: Start PostgreSQL and the Gateway<a class="headerlink" href="#step-3-start-postgresql-and-the-gateway" title="Permanent link">&para;</a></h3>
+<pre><code class="language-bash">scripts/start_oss_server.sh -c -g
+</code></pre>
+<h3 id="step-4-connect-and-test">Step 4: Connect and Test<a class="headerlink" href="#step-4-connect-and-test" title="Permanent link">&para;</a></h3>
+<h4 id="using-a-mongodb-client">Using a MongoDB Client<a class="headerlink" href="#using-a-mongodb-client" title="Permanent link">&para;</a></h4>
+<pre><code class="language-bash">mongosh --host localhost --port 10260 --tls --tlsAllowInvalidCertificates -u docdb_user -p Admin100
+</code></pre>
+<p>Try basic MongoDB commands to verify everything works.</p>
+<h4 id="using-postgresql-shell">Using PostgreSQL shell<a class="headerlink" href="#using-postgresql-shell" title="Permanent link">&para;</a></h4>
+<pre><code class="language-bash">psql -p 9712 -d postgres
+</code></pre>
+<h3 id="need-help">Need Help?<a class="headerlink" href="#need-help" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Join our <a href="https://discord.gg/vH7bYu524D">Discord</a></li>
+<li>See <a href="https://documentdb.io/docs">docs</a> for more details</li>
+</ul>
+              
+            </div>
+          </div><footer>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+        <span>
+          <a href="https://github.com/microsoft/documentdb" class="fa fa-github" style="color: #fcfcfc"> GitHub</a>
+        </span>
+    
+    
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+      <script src="../../search/main.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>
