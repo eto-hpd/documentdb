@@ -41,5 +41,11 @@ pub async fn validate_list_databases(client: &Client) -> Result<(), Error> {
         .await?;
     assert_eq!(result.get_array("databases").unwrap().len(), 1);
 
+    let result = client
+        .database("admin")
+        .run_command(doc! {"listDatabases": 1, "nameOnly": true, "authorizedDatabases": true})
+        .await?;
+    assert!(!result.get_array("databases").unwrap().is_empty());
+
     Ok(())
 }

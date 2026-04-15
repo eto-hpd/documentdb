@@ -35,6 +35,7 @@
 PG_FUNCTION_INFO_V1(command_db_stats);
 PG_FUNCTION_INFO_V1(command_db_stats_worker);
 PG_FUNCTION_INFO_V1(command_list_databases);
+PG_FUNCTION_INFO_V1(command_list_databases_worker);
 
 
 /*
@@ -57,13 +58,34 @@ typedef struct
 	int ok;
 } DbStatsResult;
 
+typedef struct DatabaseCollections
+{
+	char *databaseName;
+	List *collectionIdsList;
+	int64 collections;
+	int64 views;
+	int64 sizeOnDisk;
+	bool empty;
+} DatabaseCollections;
+
+
 /* Forward Declaration */
+
+Datum command_list_databases_worker(PG_FUNCTION_ARGS);
 
 static pgbson * DbStatsCoordinator(Datum databaseName, int32 scale);
 static pgbson * DbStatsWorker(void *fcinfoPointer);
+static pgbson * ListDatabasesCoordinator(List *databaseNames, pgbson *filter,
+										 bool nameOnly);
+static pgbson * ListDatabasesWorker(void *fcinfoPointer);
 static void BuildResultData(Datum databaseName, DbStatsResult *result, int32 scale);
 static pgbson * BuildResponseMessage(DbStatsResult *result);
 static void MergeWorkerResults(DbStatsResult *result, List *workerResults, int32 scale);
+static void MergeListDatabaseWorkerResults(List *databaseCollectionsList,
+										   List *workerResults);
+static List * GetAllDatabaseNames(void);
+static List * GetAllDatabaseCollections(List *databaseNames);
+static bool DatabaseDocumentMatchesFilter(pgbson *document, pgbson *filter);
 static bool GetAllMongoCollectionShardOidsAndNamesInDB(ArrayType *collectionIdArray,
 													   ArrayType **shardIdArray,
 													   ArrayType **shardNames);
@@ -72,6 +94,10 @@ static void GetPostgresRelationSizes(ArrayType *relationIds, int64 *totalRelatio
 static int64 GetPostgresDocumentCountStats(ArrayType *relationIds);
 static int32 GetAverageDocumentSizeFromStats(ArrayType *relationIds);
 static List * GetAllCollectionIdsInDb(Datum databaseNameDatum, int64 *views);
+static ArrayType * BuildDatabaseNamesArray(List *databaseCollectionsList);
+static ArrayType * BuildCollectionOffsetsArray(List *databaseCollectionsList);
+static ArrayType * BuildFlattenedCollectionIdsArray(List *databaseCollectionsList);
+static int64 GetFlattenedCollectionCount(List *databaseCollectionsList);
 
 
 /*
@@ -156,6 +182,15 @@ command_list_databases(PG_FUNCTION_ARGS)
 			EnsureTopLevelFieldIsBooleanLike("nameOnly", &specIter);
 			nameOnly = BsonValueAsBool(bson_iter_value(&specIter));
 		}
+		else if (strcmp(key, "authorizedDatabases") == 0)
+		{
+			/*
+			 * Mongosh helpers such as getDBs/show dbs include this flag.
+			 * We currently do not scope results differently, but we must
+			 * accept the field for wire compatibility.
+			 */
+			EnsureTopLevelFieldIsBooleanLike("authorizedDatabases", &specIter);
+		}
 		else if (strcmp(key, "filter") == 0)
 		{
 			EnsureTopLevelFieldType("filter", &specIter, BSON_TYPE_DOCUMENT);
@@ -172,61 +207,9 @@ command_list_databases(PG_FUNCTION_ARGS)
 		}
 	}
 
-	const char *sizeOnDiskSelector = "";
-	const char *totalSizeSelector = "";
-	const char *filterString = "";
-
-	if (!nameOnly)
-	{
-		sizeOnDiskSelector = ", 0::int8 AS \"sizeOnDisk\", false AS empty";
-		totalSizeSelector =
-			"pg_catalog.pg_database_size(pg_catalog.current_database())::int8 AS \"totalSize\", ";
-	}
-
-	if (filter != NULL)
-	{
-		filterString = FormatSqlQuery("WHERE document OPERATOR(%s.@@) $1",
-									  ApiCatalogSchemaName);
-	}
-
-	/* We can definitely do better here. TODO: Improve size tracking etc. */
-	const char *cmdStr = FormatSqlQuery(
-		"WITH r1 AS (SELECT DISTINCT database_name AS name %s FROM %s.collections),"
-		"r2 AS (SELECT %s.row_get_bson(r1) AS document FROM r1),"
-		"r3 AS (SELECT document FROM r2 %s),"
-		"r4 AS (SELECT COALESCE(%s.bson_array_agg(r3.document, ''), '{ \"\": [] }') AS "
-		"databases" ",%s 1.0::float8 AS " "ok" " FROM r3)"
-											   "SELECT %s.row_get_bson(r4) AS document FROM r4",
-		sizeOnDiskSelector, ApiCatalogSchemaName, CoreSchemaName, filterString,
-		ApiCatalogSchemaName, totalSizeSelector, CoreSchemaName);
-
-	bool isNull = false;
-	bool readOnly = true;
-	Datum result;
-
-	if (filter != NULL)
-	{
-		Oid argTypes[1] = { BsonTypeId() };
-		Datum argValues[1] = { PointerGetDatum(filter) };
-		char *argNulls = NULL;
-		result = ExtensionExecuteQueryWithArgsViaSPI(cmdStr, 1, argTypes,
-													 argValues, argNulls,
-													 readOnly, SPI_OK_SELECT,
-													 &isNull);
-	}
-	else
-	{
-		result = ExtensionExecuteQueryViaSPI(cmdStr, readOnly, SPI_OK_SELECT,
-											 &isNull);
-	}
-
-	if (isNull)
-	{
-		ereport(ERROR, (errmsg(
-							"list_databases unexpectedly returned NULL")));
-	}
-
-	PG_RETURN_DATUM(result);
+	List *databaseNames = GetAllDatabaseNames();
+	pgbson *response = ListDatabasesCoordinator(databaseNames, filter, nameOnly);
+	PG_RETURN_POINTER(response);
 }
 
 
@@ -321,6 +304,225 @@ BuildResultData(Datum databaseName, DbStatsResult *result, int32 scale)
 	 * the index metadata is only present at coordinator
 	 */
 	result->indexes = CollectionIdsGetIndexCount(collectionIdArray);
+}
+
+
+/*
+ * Returns all logical database names known to the catalog.
+ */
+static List *
+GetAllDatabaseNames(void)
+{
+	List *databaseNames = NIL;
+	const char *query = FormatSqlQuery(
+		"SELECT DISTINCT database_name FROM %s.collections ORDER BY database_name",
+		ApiCatalogSchemaName);
+
+	bool readOnly = true;
+	MemoryContext priorMemoryContext = CurrentMemoryContext;
+
+	SPI_connect();
+
+	Portal statsPortal = SPI_cursor_open_with_args("listDatabasesGetDatabaseNames",
+												   query, 0, NULL, NULL, NULL,
+												   readOnly, 0);
+	bool hasData = true;
+	while (hasData)
+	{
+		SPI_cursor_fetch(statsPortal, true, INT_MAX);
+
+		hasData = SPI_processed >= 1;
+		if (!hasData)
+		{
+			break;
+		}
+
+		if (SPI_tuptable == NULL)
+		{
+			ereport(ERROR, (errmsg("%s.collections table was null for listDatabases.",
+								   ApiCatalogSchemaName)));
+		}
+
+		for (int tupleNumber = 0; tupleNumber < (int) SPI_processed; tupleNumber++)
+		{
+			bool isNull = false;
+			Datum databaseNameDatum = SPI_getbinval(SPI_tuptable->vals[tupleNumber],
+													SPI_tuptable->tupdesc, 1, &isNull);
+			if (isNull)
+			{
+				continue;
+			}
+
+			MemoryContext spiContext = MemoryContextSwitchTo(priorMemoryContext);
+			databaseNames = lappend(databaseNames,
+									pstrdup(TextDatumGetCString(databaseNameDatum)));
+			MemoryContextSwitchTo(spiContext);
+		}
+	}
+
+	SPI_cursor_close(statsPortal);
+	SPI_finish();
+
+	return databaseNames;
+}
+
+
+/*
+ * Loads collection metadata for all logical databases needed by listDatabases.
+ */
+static List *
+GetAllDatabaseCollections(List *databaseNames)
+{
+	List *databaseCollectionsList = NIL;
+	ListCell *cell;
+	foreach(cell, databaseNames)
+	{
+		char *databaseName = lfirst(cell);
+		int64 views = 0;
+		List *collectionIdsList =
+			GetAllCollectionIdsInDb(CStringGetTextDatum(databaseName), &views);
+
+		DatabaseCollections *entry = palloc0(sizeof(DatabaseCollections));
+		entry->databaseName = pstrdup(databaseName);
+		entry->collectionIdsList = collectionIdsList;
+		entry->collections = list_length(collectionIdsList);
+		entry->views = views;
+		entry->sizeOnDisk = 0;
+		entry->empty = (entry->collections == 0 && entry->views == 0);
+
+		databaseCollectionsList = lappend(databaseCollectionsList, entry);
+	}
+
+	return databaseCollectionsList;
+}
+
+
+static int64
+GetFlattenedCollectionCount(List *databaseCollectionsList)
+{
+	int64 totalCollections = 0;
+	ListCell *cell;
+	foreach(cell, databaseCollectionsList)
+	{
+		DatabaseCollections *entry = lfirst(cell);
+		totalCollections += entry->collections;
+	}
+
+	return totalCollections;
+}
+
+
+static ArrayType *
+BuildDatabaseNamesArray(List *databaseCollectionsList)
+{
+	int32 databaseCount = list_length(databaseCollectionsList);
+	if (databaseCount == 0)
+	{
+		return construct_empty_array(TEXTOID);
+	}
+
+	Datum *databaseNameDatums = palloc0(sizeof(Datum) * databaseCount);
+	int32 i = 0;
+	ListCell *cell;
+	foreach(cell, databaseCollectionsList)
+	{
+		DatabaseCollections *entry = lfirst(cell);
+		databaseNameDatums[i++] = CStringGetTextDatum(entry->databaseName);
+	}
+
+	ArrayType *databaseNamesArray = construct_array(databaseNameDatums, databaseCount,
+													TEXTOID, -1, false,
+													TYPALIGN_INT);
+	pfree(databaseNameDatums);
+	return databaseNamesArray;
+}
+
+
+static ArrayType *
+BuildCollectionOffsetsArray(List *databaseCollectionsList)
+{
+	int32 databaseCount = list_length(databaseCollectionsList);
+	if (databaseCount == 0)
+	{
+		return construct_empty_array(INT4OID);
+	}
+
+	Datum *offsetDatums = palloc0(sizeof(Datum) * (databaseCount + 1));
+	int32 offset = 0;
+	int32 i = 0;
+	ListCell *cell;
+	foreach(cell, databaseCollectionsList)
+	{
+		DatabaseCollections *entry = lfirst(cell);
+		offsetDatums[i++] = Int32GetDatum(offset);
+		offset += entry->collections;
+	}
+
+	offsetDatums[i] = Int32GetDatum(offset);
+
+	ArrayType *offsetsArray = construct_array(offsetDatums, databaseCount + 1,
+											  INT4OID, sizeof(int32), true,
+											  TYPALIGN_INT);
+	pfree(offsetDatums);
+	return offsetsArray;
+}
+
+
+static ArrayType *
+BuildFlattenedCollectionIdsArray(List *databaseCollectionsList)
+{
+	int64 totalCollections = GetFlattenedCollectionCount(databaseCollectionsList);
+	if (totalCollections == 0)
+	{
+		return construct_empty_array(INT8OID);
+	}
+
+	Datum *collectionIdDatums = palloc0(sizeof(Datum) * totalCollections);
+	int64 i = 0;
+	ListCell *dbCell;
+	foreach(dbCell, databaseCollectionsList)
+	{
+		DatabaseCollections *entry = lfirst(dbCell);
+		ListCell *collectionCell;
+		foreach(collectionCell, entry->collectionIdsList)
+		{
+			uint64 collectionId = *(uint64 *) lfirst(collectionCell);
+			collectionIdDatums[i++] = Int64GetDatum(collectionId);
+		}
+	}
+
+	ArrayType *collectionIdsArray = construct_array(collectionIdDatums, totalCollections,
+													INT8OID,
+													sizeof(uint64), true,
+													TYPALIGN_INT);
+	pfree(collectionIdDatums);
+	return collectionIdsArray;
+}
+
+
+/*
+ * Evaluates the listDatabases filter against a single database document.
+ */
+static bool
+DatabaseDocumentMatchesFilter(pgbson *document, pgbson *filter)
+{
+	if (filter == NULL)
+	{
+		return true;
+	}
+
+	const char *query = FormatSqlQuery(
+		"SELECT $1::%s OPERATOR(%s.@@) $2::%s",
+		FullBsonTypeName, ApiCatalogSchemaName, FullBsonTypeName);
+	Oid argTypes[2] = { BsonTypeId(), BsonTypeId() };
+	Datum argValues[2] = { PointerGetDatum(document), PointerGetDatum(filter) };
+	bool isNull = false;
+	bool readOnly = true;
+	Datum result = ExtensionExecuteQueryWithArgsViaSPI(query, 2, argTypes, argValues,
+													   NULL, readOnly, SPI_OK_SELECT,
+													   &isNull);
+
+	return !isNull && DatumGetBool(result);
 }
 
 
@@ -888,4 +1090,307 @@ GetAverageDocumentSizeFromStats(ArrayType *relationNames)
 	}
 
 	return DatumGetInt32(result);
+}
+
+
+static pgbson *
+ListDatabasesCoordinator(List *databaseNames, pgbson *filter, bool nameOnly)
+{
+	pgbson_writer resultWriter;
+	PgbsonWriterInit(&resultWriter);
+	pgbson_array_writer databasesWriter;
+	PgbsonWriterStartArray(&resultWriter, "databases", 9, &databasesWriter);
+
+	if (nameOnly)
+	{
+		ListCell *cell;
+		foreach(cell, databaseNames)
+		{
+			char *databaseName = lfirst(cell);
+			pgbson_writer databaseWriter;
+			PgbsonWriterInit(&databaseWriter);
+			PgbsonWriterAppendUtf8(&databaseWriter, "name", 4, databaseName);
+
+			pgbson *databaseDocument = PgbsonWriterGetPgbson(&databaseWriter);
+			if (!DatabaseDocumentMatchesFilter(databaseDocument, filter))
+			{
+				continue;
+			}
+
+			PgbsonArrayWriterWriteDocument(&databasesWriter, databaseDocument);
+		}
+
+		PgbsonWriterEndArray(&resultWriter, &databasesWriter);
+		PgbsonWriterAppendDouble(&resultWriter, "ok", 2, 1.0);
+		return PgbsonWriterGetPgbson(&resultWriter);
+	}
+
+	List *databaseCollectionsList = GetAllDatabaseCollections(databaseNames);
+	if (GetFlattenedCollectionCount(databaseCollectionsList) > 0)
+	{
+		ArrayType *databaseNamesArray = BuildDatabaseNamesArray(databaseCollectionsList);
+		ArrayType *collectionOffsetsArray =
+			BuildCollectionOffsetsArray(databaseCollectionsList);
+		ArrayType *collectionIdsArray =
+			BuildFlattenedCollectionIdsArray(databaseCollectionsList);
+
+		int numValues = 3;
+		Datum values[3] = {
+			PointerGetDatum(databaseNamesArray),
+			PointerGetDatum(collectionOffsetsArray),
+			PointerGetDatum(collectionIdsArray)
+		};
+		Oid types[3] = { TEXTARRAYOID, INT4ARRAYOID, INT8ARRAYOID };
+
+		List *workerBsons = RunQueryOnAllServerNodes("ListDatabases", values, types,
+													 numValues,
+													 command_list_databases_worker,
+													 ApiInternalSchemaName,
+													 "list_databases_worker");
+		MergeListDatabaseWorkerResults(databaseCollectionsList, workerBsons);
+	}
+
+	int64 totalSize = 0;
+	ListCell *cell;
+	foreach(cell, databaseCollectionsList)
+	{
+		DatabaseCollections *entry = lfirst(cell);
+		pgbson_writer databaseWriter;
+		PgbsonWriterInit(&databaseWriter);
+		PgbsonWriterAppendUtf8(&databaseWriter, "name", 4, entry->databaseName);
+		PgbsonWriterAppendInt64(&databaseWriter, "sizeOnDisk", 10, entry->sizeOnDisk);
+		PgbsonWriterAppendBool(&databaseWriter, "empty", 5, entry->empty);
+
+		pgbson *databaseDocument = PgbsonWriterGetPgbson(&databaseWriter);
+		if (!DatabaseDocumentMatchesFilter(databaseDocument, filter))
+		{
+			continue;
+		}
+
+		totalSize += entry->sizeOnDisk;
+		PgbsonArrayWriterWriteDocument(&databasesWriter, databaseDocument);
+	}
+
+	PgbsonWriterEndArray(&resultWriter, &databasesWriter);
+	PgbsonWriterAppendInt64(&resultWriter, "totalSize", 9, totalSize);
+	PgbsonWriterAppendDouble(&resultWriter, "ok", 2, 1.0);
+	return PgbsonWriterGetPgbson(&resultWriter);
+}
+
+
+Datum
+command_list_databases_worker(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0))
+	{
+		ereport(ERROR, (errmsg("databaseNames array can not be NULL")));
+	}
+	else if (PG_ARGISNULL(1))
+	{
+		ereport(ERROR, (errmsg("collectionOffsets array can not be NULL")));
+	}
+	else if (PG_ARGISNULL(2))
+	{
+		ereport(ERROR, (errmsg("collectionId array can not be NULL")));
+	}
+
+	pgbson *response = RunWorkerDiagnosticLogic(&ListDatabasesWorker, fcinfo);
+	PG_RETURN_POINTER(response);
+}
+
+
+static pgbson *
+ListDatabasesWorker(void *fcinfoPointer)
+{
+	PG_FUNCTION_ARGS = fcinfoPointer;
+	ArrayType *databaseNamesArray = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType *collectionOffsetsArray = PG_GETARG_ARRAYTYPE_P(1);
+	ArrayType *collectionIdArray = PG_GETARG_ARRAYTYPE_P(2);
+
+	Datum *databaseNameDatums = NULL;
+	bool *databaseNameNulls = NULL;
+	int numDatabases = 0;
+	deconstruct_array(databaseNamesArray, TEXTOID, -1, false, TYPALIGN_INT,
+					  &databaseNameDatums, &databaseNameNulls, &numDatabases);
+
+	Datum *collectionOffsetDatums = NULL;
+	bool *collectionOffsetNulls = NULL;
+	int numOffsets = 0;
+	deconstruct_array(collectionOffsetsArray, INT4OID, sizeof(int32), true,
+					  TYPALIGN_INT, &collectionOffsetDatums, &collectionOffsetNulls,
+					  &numOffsets);
+
+	Datum *collectionIdDatums = NULL;
+	bool *collectionIdNulls = NULL;
+	int numCollections = 0;
+	deconstruct_array(collectionIdArray, INT8OID, sizeof(uint64), true, TYPALIGN_INT,
+					  &collectionIdDatums, &collectionIdNulls, &numCollections);
+
+	if (numOffsets != numDatabases + 1)
+	{
+		ereport(ERROR, (errmsg(
+							"collectionOffsets length must equal databaseNames length + 1")));
+	}
+
+	pgbson_writer writer;
+	PgbsonWriterInit(&writer);
+	pgbson_array_writer sizeOnDiskWriter;
+	PgbsonWriterStartArray(&writer, "sizeOnDisk", 10, &sizeOnDiskWriter);
+
+	for (int dbIndex = 0; dbIndex < numDatabases; dbIndex++)
+	{
+		if (databaseNameNulls[dbIndex] || collectionOffsetNulls[dbIndex] ||
+			collectionOffsetNulls[dbIndex + 1])
+		{
+			ereport(ERROR, (errmsg(
+								"listDatabases worker input arrays cannot contain NULLs")));
+		}
+
+		char *databaseName = TextDatumGetCString(databaseNameDatums[dbIndex]);
+		int32 startOffset = DatumGetInt32(collectionOffsetDatums[dbIndex]);
+		int32 endOffset = DatumGetInt32(collectionOffsetDatums[dbIndex + 1]);
+		if (startOffset < 0 || endOffset < startOffset || endOffset > numCollections)
+		{
+			ereport(ERROR, (errmsg(
+								"Invalid collectionOffsets supplied to listDatabases worker for database %s",
+								databaseName)));
+		}
+
+		int64 totalRelationSize = 0;
+		int32 collectionCount = endOffset - startOffset;
+		if (collectionCount > 0)
+		{
+			for (int collectionIndex = startOffset; collectionIndex < endOffset;
+				 collectionIndex++)
+			{
+				if (collectionIdNulls[collectionIndex])
+				{
+					ereport(ERROR, (errmsg(
+										"listDatabases worker collectionIds cannot contain NULLs")));
+				}
+			}
+
+			ArrayType *databaseCollectionIdsArray =
+				construct_array(&collectionIdDatums[startOffset], collectionCount,
+								INT8OID, sizeof(uint64), true, TYPALIGN_INT);
+			ArrayType *shardNames = NULL;
+			ArrayType *shardOids = NULL;
+
+			if (GetAllMongoCollectionShardOidsAndNamesInDB(databaseCollectionIdsArray,
+														   &shardOids,
+														   &shardNames))
+			{
+				int64 totalTableSize = 0;
+				GetPostgresRelationSizes(shardOids, &totalRelationSize, &totalTableSize);
+			}
+		}
+
+		bson_value_t sizeValue = { 0 };
+		sizeValue.value_type = BSON_TYPE_INT64;
+		sizeValue.value.v_int64 = totalRelationSize;
+		PgbsonArrayWriterWriteValue(&sizeOnDiskWriter, &sizeValue);
+	}
+
+	PgbsonWriterEndArray(&writer, &sizeOnDiskWriter);
+	return PgbsonWriterGetPgbson(&writer);
+}
+
+
+static void
+MergeListDatabaseWorkerResults(List *databaseCollectionsList, List *workerResults)
+{
+	int dbCount = list_length(databaseCollectionsList);
+	if (dbCount == 0)
+	{
+		return;
+	}
+
+	DatabaseCollections **databaseCollections = palloc0(sizeof(DatabaseCollections *) *
+														dbCount);
+	int dbIndex = 0;
+	ListCell *dbCell;
+	foreach(dbCell, databaseCollectionsList)
+	{
+		databaseCollections[dbIndex++] = lfirst(dbCell);
+	}
+
+	ListCell *workerCell;
+	foreach(workerCell, workerResults)
+	{
+		pgbson *workerBson = lfirst(workerCell);
+		bson_iter_t workerIter;
+		PgbsonInitIterator(workerBson, &workerIter);
+
+		int errorCode = 0;
+		const char *errorMessage = NULL;
+		bool sawSizeArray = false;
+
+		while (bson_iter_next(&workerIter))
+		{
+			const char *key = bson_iter_key(&workerIter);
+			if (strcmp(key, ErrCodeKey) == 0)
+			{
+				errorCode = BsonValueAsInt32(bson_iter_value(&workerIter));
+			}
+			else if (strcmp(key, ErrMsgKey) == 0)
+			{
+				const char *string = bson_iter_utf8(&workerIter, NULL);
+				errorMessage = pstrdup(string);
+			}
+			else if (strcmp(key, "sizeOnDisk") == 0)
+			{
+				bson_iter_t sizeOnDiskIter;
+				if (!bson_iter_recurse(&workerIter, &sizeOnDiskIter))
+				{
+					ereport(ERROR, (errmsg(
+										"listDatabases worker sizeOnDisk field must be an array")));
+				}
+
+				int sizeIndex = 0;
+				while (bson_iter_next(&sizeOnDiskIter))
+				{
+					if (sizeIndex >= dbCount)
+					{
+						ereport(ERROR, (errmsg(
+											"listDatabases worker returned too many sizeOnDisk values")));
+					}
+
+					databaseCollections[sizeIndex]->sizeOnDisk +=
+						BsonValueAsInt64(bson_iter_value(&sizeOnDiskIter));
+					sizeIndex++;
+				}
+
+				if (sizeIndex != dbCount)
+				{
+					ereport(ERROR, (errmsg(
+										"listDatabases worker returned too few sizeOnDisk values")));
+				}
+
+				sawSizeArray = true;
+			}
+			else
+			{
+				ereport(ERROR, (errmsg(
+									"unknown field received from listDatabases worker %s",
+									key)));
+			}
+		}
+
+		if (errorMessage != NULL)
+		{
+			errorCode = errorCode == 0 ? ERRCODE_DOCUMENTDB_INTERNALERROR : errorCode;
+			ereport(ERROR, (errcode(errorCode),
+							errmsg("Error running listDatabases %s", errorMessage),
+							errdetail_log("Error running listDatabases %s",
+										  errorMessage)));
+		}
+
+		if (!sawSizeArray)
+		{
+			ereport(ERROR, (errmsg(
+								"listDatabases worker response was missing sizeOnDisk")));
+		}
+	}
+
+	pfree(databaseCollections);
 }

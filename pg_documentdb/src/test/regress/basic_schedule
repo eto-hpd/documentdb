@@ -30,3 +30,4 @@ test: commands_roles_info
 test: commands_drop_role
 test: commands_killop
 test: bson_mem_vtable_palloc_test
+test: list_databases_tests
